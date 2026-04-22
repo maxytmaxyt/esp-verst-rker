@@ -2,7 +2,13 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include <lwip/napt.h>
+
+// Improved include for NAPT
+#if LWIP_FEATURES && !defined(IP_NAPT)
+#define IP_NAPT 1
+#endif
+#include "lwip/napt.h"
+#include "lwip/dns.h"
 
 /* --- Configuration & Pins --- */
 #define RESET_BUTTON_PIN 0 // BOOT button on most ESP32 boards
