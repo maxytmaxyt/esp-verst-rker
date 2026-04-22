@@ -10,7 +10,12 @@
 // to CONFIG_LWIP_IPV4_NAPT — already enabled in this SDK build.
 #include "lwip/ip4_napt.h"
 #include "lwip/lwip_napt.h"
+#include <lwip/lwip_napt.h>
+#include <lwip/err.h>
 
+// If SOFTAP_IF is still not recognized, define it or use the ESP-IDF constant
+#define NAPT_IFACE_SOFTAP 1 
+#define NAPT_IFACE_STA    0
 /* --- Configuration & Pins --- */
 #define RESET_BUTTON_PIN 0  // BOOT button on most ESP32 boards
 #define CONFIG_SSID "ESP32_Admin_Setup"
