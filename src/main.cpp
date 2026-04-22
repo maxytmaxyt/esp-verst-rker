@@ -3,12 +3,19 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// Improved include for NAPT
-#if LWIP_FEATURES && !defined(IP_NAPT)
-#define IP_NAPT 1
-#endif
-#include "lwip/napt.h"
-#include "lwip/dns.h"
+// Professional way to include LwIP NAPT headers for ESP32
+#include "lwip/opt.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/lwip_napt.h" // In newer SDKs it's named lwip_napt.h
+#include "lwip/napt.h"      // In older SDKs it's napt.h
+
+// If the compiler still complains, we manually define the function signature
+extern "C" {
+    #include <errno.h>
+    err_t ip_napt_init(unsigned long max_nat, unsigned long max_port);
+    err_t ip_napt_enable_no(unsigned char ifident, unsigned char enable);
+}
 
 /* --- Configuration & Pins --- */
 #define RESET_BUTTON_PIN 0 // BOOT button on most ESP32 boards
