@@ -172,6 +172,26 @@ void startRepeaterMode() {
     }
 
     Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+    
+    // Set up the AP
+    const char* ap_p = (config.ap_pass.length() >= 8) ? config.ap_pass.c_str() : nullptr;
+    WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid ? 1 : 0);
+
+    // Initialize NAPT
+    // We use the literals or your build_flags here
+    ip_napt_init(IP_NAPT_MAX, IP_PORT_MAX);
+    
+    // Enable NAPT on the SoftAP interface
+    if (ip_napt_enable_no(SOFTAP_IF, 1) == ERR_OK) {
+        Serial.println("NAPT enabled successfully.");
+    } else {
+        Serial.println("NAPT failed to initialize.");
+    }
+
+    Serial.println("NAT Router is online.");
+}
+
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.println("Starting NAT AP...");
 
     // Open network if password too short for WPA2 (min 8 chars)
