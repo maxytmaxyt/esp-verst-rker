@@ -48,7 +48,7 @@ jobs:
 
       # --- NEU: Statische Code-Analyse (Check) ---
       - name: Static Code Analysis
-        run: pio check --skip-packages
+        run: pio check
 
       - name: Run PlatformIO Build
         run: pio run
