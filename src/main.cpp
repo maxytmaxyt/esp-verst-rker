@@ -3,38 +3,43 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// Professional way to include LwIP NAPT headers for ESP32
-#include "lwip/opt.h"
-#include "lwip/err.h"
-#include "lwip/sys.h"
-#include "lwip/lwip_napt.h" // In newer SDKs it's named lwip_napt.h
-#include "lwip/napt.h"      // In older SDKs it's napt.h
-
-// If the compiler still complains, we manually define the function signature
-extern "C" {
-    #include <errno.h>
-    err_t ip_napt_init(unsigned long max_nat, unsigned long max_port);
-    err_t ip_napt_enable_no(unsigned char ifident, unsigned char enable);
-}
+// NAPT header — correct path for espressif32 Arduino SDK
+#include "lwip/lwip_napt.h"
 
 /* --- Configuration & Pins --- */
 #define RESET_BUTTON_PIN 0 // BOOT button on most ESP32 boards
 #define CONFIG_SSID "ESP32_Admin_Setup"
+
+// Fallback defines in case SDK version doesn't expose these
+#ifndef IP_NAPT_MAX
+  #define IP_NAPT_MAX 512
+#endif
+#ifndef IP_PORT_MAX
+  #define IP_PORT_MAX 512
+#endif
+
+// ESP_IF_WIFI_AP is the correct constant in current ESP-IDF / Arduino Core
+// SOFTAP_IF (= 1) is deprecated in newer SDKs
+#ifndef ESP_IF_WIFI_AP
+  #define ESP_IF_WIFI_AP 1
+#endif
 
 WebServer server(80);
 Preferences preferences;
 
 /* --- Global Settings Variables --- */
 struct DeviceConfig {
-  String sta_ssid;
-  String sta_pass;
-  String ap_ssid;
-  String ap_pass;
-  bool hide_ssid;
+    String sta_ssid;
+    String sta_pass;
+    String ap_ssid;
+    String ap_pass;
+    bool hide_ssid;
 } config;
 
-/* --- HTML Dashboard (Embedded CSS) --- */
-const char INDEX_HTML[] PROGMEM = R"=====(
+/* --- HTML Dashboard (Embedded) --- */
+// Uses server-side string building so current values are pre-filled
+String buildIndexHtml() {
+    String html = F(R"=====(
 <!DOCTYPE html>
 <html lang='en'>
 <head>
@@ -48,7 +53,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         .card { background: var(--card); padding: 25px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
         h2 { text-align: center; color: var(--primary); margin-bottom: 25px; }
         label { display: block; margin: 10px 0 5px; font-size: 0.9em; color: #aaa; }
-        input[type='text'], input[type='password'], select {
+        input[type='text'], input[type='password'] {
             width: 100%; padding: 12px; margin-bottom: 15px; border: 1px solid #333; border-radius: 8px;
             background: #252525; color: white; box-sizing: border-box;
         }
@@ -69,18 +74,23 @@ const char INDEX_HTML[] PROGMEM = R"=====(
             <h2>Repeater Settings</h2>
             <form action='/save' method='POST'>
                 <label>Target Network (Uplink)</label>
-                <input name='s_sta' type='text' placeholder='Router SSID' required>
+                <input name='s_sta' type='text' placeholder='Router SSID' value=')=====");
+    html += config.sta_ssid;
+    html += F(R"=====(' required>
                 <input name='p_sta' type='password' placeholder='Router Password'>
-                
+
                 <label>Broadcast Network (Downlink)</label>
-                <input name='s_ap' type='text' placeholder='New Network Name' value='ESP32_Repeater' required>
+                <input name='s_ap' type='text' placeholder='New Network Name' value=')=====");
+    html += config.ap_ssid;
+    html += F(R"=====(' required>
                 <input name='p_ap' type='password' placeholder='New Password (min. 8 chars)'>
-                
+
                 <div class='checkbox-group'>
-                    <input name='hide' type='checkbox' id='hide'>
+                    <input name='hide' type='checkbox' id='hide')=====");
+    if (config.hide_ssid) html += F(" checked");
+    html += F(R"=====(>
                     <label for='hide'>Hide SSID (Hidden Network)</label>
                 </div>
-
                 <button type='submit' class='btn'>Apply Settings</button>
             </form>
         </div>
@@ -88,17 +98,19 @@ const char INDEX_HTML[] PROGMEM = R"=====(
     </div>
 </body>
 </html>
-)=====";
+)=====");
+    return html;
+}
 
 /* --- Logic Functions --- */
 
 void loadConfig() {
     preferences.begin("wifi_store", true);
-    config.sta_ssid = preferences.getString("s_sta", "");
-    config.sta_pass = preferences.getString("p_sta", "");
-    config.ap_ssid  = preferences.getString("s_ap", "ESP32_Repeater");
-    config.ap_pass  = preferences.getString("p_ap", "");
-    config.hide_ssid = preferences.getBool("hide", false);
+    config.sta_ssid   = preferences.getString("s_sta", "");
+    config.sta_pass   = preferences.getString("p_sta", "");
+    config.ap_ssid    = preferences.getString("s_ap", "ESP32_Repeater");
+    config.ap_pass    = preferences.getString("p_ap", "");
+    config.hide_ssid  = preferences.getBool("hide", false);
     preferences.end();
 }
 
@@ -115,12 +127,12 @@ void handleSave() {
     preferences.begin("wifi_store", false);
     preferences.putString("s_sta", server.arg("s_sta"));
     preferences.putString("p_sta", server.arg("p_sta"));
-    preferences.putString("s_ap", server.arg("s_ap"));
-    preferences.putString("p_ap", server.arg("p_ap"));
-    preferences.setBool("hide", server.hasArg("hide"));
+    preferences.putString("s_ap",  server.arg("s_ap"));
+    preferences.putString("p_ap",  server.arg("p_ap"));
+    preferences.putBool("hide", server.hasArg("hide"));
     preferences.end();
-    
-    String msg = "Settings Saved. System is restarting and connecting to " + server.arg("s_sta");
+
+    String msg = "Settings saved. Restarting and connecting to: " + server.arg("s_sta");
     server.send(200, "text/plain", msg);
     delay(2000);
     ESP.restart();
@@ -129,18 +141,18 @@ void handleSave() {
 void startConfigMode() {
     Serial.println("Action: Starting AP Config Mode");
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(CONFIG_SSID); 
-    server.on("/", []() { server.send(200, "text/html", INDEX_HTML); });
+    WiFi.softAP(CONFIG_SSID);
+    server.on("/", []() { server.send(200, "text/html", buildIndexHtml()); });
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
+    Serial.printf("Config portal running at: http://%s\n", WiFi.softAPIP().toString().c_str());
 }
 
 void startRepeaterMode() {
-    Serial.printf("Action: Connecting to %s...\n", config.sta_ssid.c_str());
+    Serial.printf("Action: Connecting to '%s'...\n", config.sta_ssid.c_str());
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(config.sta_ssid.c_str(), config.sta_pass.c_str());
 
-    // Wait for connection with timeout
     unsigned long startAttempt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
         delay(500);
@@ -153,27 +165,27 @@ void startRepeaterMode() {
         return;
     }
 
-    Serial.println("\nConnected! Starting NAT AP...");
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.println("Starting NAT AP...");
 
-    // Setup the Access Point with visibility settings
-    // If ap_pass is empty, it becomes an open network
-    const char* ap_p = config.ap_pass.length() >= 8 ? config.ap_pass.c_str() : NULL;
-    WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid);
+    // Open network if password is shorter than 8 chars (WPA2 minimum)
+    const char* ap_p = (config.ap_pass.length() >= 8) ? config.ap_pass.c_str() : nullptr;
+    WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid ? 1 : 0);
 
-    // NAPT setup for routing traffic
+    // Enable NAT/NAPT routing from AP -> STA
     ip_napt_init(IP_NAPT_MAX, IP_PORT_MAX);
-    ip_napt_enable_no(SOFTAP_IF, 1);
-    
-    Serial.println("NAT Router is online.");
+    ip_napt_enable_no(ESP_IF_WIFI_AP, 1);
+
+    Serial.printf("NAT Router online. AP: '%s'\n", config.ap_ssid.c_str());
 }
 
 void setup() {
     Serial.begin(115200);
+    delay(200); // Let serial stabilize
     pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
     loadConfig();
 
-    // Trigger config mode if no SSID or reset button pressed during boot
     if (config.sta_ssid == "" || digitalRead(RESET_BUTTON_PIN) == LOW) {
         startConfigMode();
     } else {
@@ -182,17 +194,18 @@ void setup() {
 }
 
 void loop() {
-    // Process WebServer requests if AP is active
-    if (WiFi.getMode() & WIFI_MODE_AP) {
+    // WebServer only active in Config Mode (WIFI_AP only)
+    // In Repeater Mode (WIFI_AP_STA) no server is running — skip handleClient
+    if (WiFi.getMode() == WIFI_AP) {
         server.handleClient();
     }
 
-    // Long press reset logic
+    // Long-press reset logic (4 seconds wipes config)
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-        delay(100); // Debounce
-        unsigned long pressTime = millis();
+        delay(50); // debounce
+        unsigned long pressStart = millis();
         while (digitalRead(RESET_BUTTON_PIN) == LOW) {
-            if (millis() - pressTime > 4000) {
+            if (millis() - pressStart > 4000) {
                 wipeMemory();
             }
         }
