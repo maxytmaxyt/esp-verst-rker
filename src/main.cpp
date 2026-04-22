@@ -3,8 +3,9 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// NAPT header — correct path for espressif32 Arduino SDK
-#include "lwip/lwip_napt.h"
+// ESP-IDF 5.x NAPT API (espressif32 >= 6.x)
+// ip_napt_init / ip_napt_enable_no no longer exist — use esp_netif NAPT API
+#include "esp_netif.h"
 
 /* --- Configuration & Pins --- */
 #define RESET_BUTTON_PIN 0 // BOOT button on most ESP32 boards
@@ -16,12 +17,6 @@
 #endif
 #ifndef IP_PORT_MAX
   #define IP_PORT_MAX 512
-#endif
-
-// ESP_IF_WIFI_AP is the correct constant in current ESP-IDF / Arduino Core
-// SOFTAP_IF (= 1) is deprecated in newer SDKs
-#ifndef ESP_IF_WIFI_AP
-  #define ESP_IF_WIFI_AP 1
 #endif
 
 WebServer server(80);
@@ -172,9 +167,19 @@ void startRepeaterMode() {
     const char* ap_p = (config.ap_pass.length() >= 8) ? config.ap_pass.c_str() : nullptr;
     WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid ? 1 : 0);
 
-    // Enable NAT/NAPT routing from AP -> STA
-    ip_napt_init(IP_NAPT_MAX, IP_PORT_MAX);
-    ip_napt_enable_no(ESP_IF_WIFI_AP, 1);
+    // Enable NAT/NAPT routing from AP -> STA via esp_netif API (ESP-IDF 5.x)
+    // Get the AP netif handle that the Arduino WiFi stack created
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif != nullptr) {
+        esp_err_t err = esp_netif_napt_enable(ap_netif);
+        if (err != ESP_OK) {
+            Serial.printf("NAPT enable failed: %s\n", esp_err_to_name(err));
+        } else {
+            Serial.println("NAPT enabled on AP interface.");
+        }
+    } else {
+        Serial.println("ERROR: Could not get AP netif handle for NAPT.");
+    }
 
     Serial.printf("NAT Router online. AP: '%s'\n", config.ap_ssid.c_str());
 }
