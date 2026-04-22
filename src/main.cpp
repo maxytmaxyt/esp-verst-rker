@@ -3,18 +3,20 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// Force C linkage for lwIP functions
+// You MUST wrap these in extern "C" so the C++ compiler can link to the C functions
 extern "C" {
-#include <lwip/lwip_napt.h>
-#include <lwip/err.h>
+  #include <lwip/lwip_napt.h>
+  #include <lwip/err.h>
 }
 
-// Ensure SOFTAP_IF is defined for the ESP32
+// Define interface indexes if they aren't provided by the headers
 #ifndef SOFTAP_IF
   #define SOFTAP_IF 1
 #endif
 
-// If SOFTAP_IF is still not recognized, define it or use the ESP-IDF constant
+#ifndef ST_IF
+  #define ST_IF 0
+#endif
 #define NAPT_IFACE_SOFTAP 1 
 #define NAPT_IFACE_STA    0
 /* --- Configuration & Pins --- */
