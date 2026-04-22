@@ -72,20 +72,22 @@ String buildIndexHtml() {
             <h2>Repeater Settings</h2>
             <form action='/save' method='POST'>
                 <label>Target Network (Uplink)</label>
-                <input name='s_sta' type='text' placeholder='Router SSID' value=')=====(");
+                <input name='s_sta' type='text' placeholder='Router SSID' value=)====="); // Hier Klammer zu!
     html += config.sta_ssid;
-    html += F(R"=====(' required>
+    html += F(R"=====( required>
                 <input name='p_sta' type='password' placeholder='Router Password'>
 
                 <label>Broadcast Network (Downlink)</label>
-                <input name='s_ap' type='text' placeholder='New Network Name' value=')=====(");
+                <input name='s_ap' type='text' placeholder='New Network Name' value=)====="); // Hier Klammer zu!
     html += config.ap_ssid;
-    html += F(R"=====(' required>
+    html += F(R"=====( required>
                 <input name='p_ap' type='password' placeholder='New Password (min. 8 chars)'>
 
                 <div class='checkbox-group'>
-                    <input name='hide' type='checkbox' id='hide')=====(");
+                    <input name='hide' type='checkbox' id='hide')====="); // Hier Klammer zu!
+    
     if (config.hide_ssid) html += F(" checked");
+    
     html += F(R"=====(>
                     <label for='hide'>Hide SSID (Hidden Network)</label>
                 </div>
@@ -96,7 +98,7 @@ String buildIndexHtml() {
     </div>
 </body>
 </html>
-)=====(");
+)====="); // Letztes Semikolon war wichtig
     return html;
 }
 
