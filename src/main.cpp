@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include "lwip/lwip_napt.h"
 
 /* * FORCE NAPT DEFINITIONS
  * These must come before the lwip includes to ensure the headers 
