@@ -3,27 +3,25 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// You MUST wrap these in extern "C" so the C++ compiler can link to the C functions
+/* * The ESP32 lwIP stack is written in C. 
+ * We must use extern "C" to prevent C++ name mangling, 
+ * otherwise the linker will not find the NAPT functions.
+ */
 extern "C" {
   #include <lwip/lwip_napt.h>
   #include <lwip/err.h>
 }
 
-// Define interface indexes if they aren't provided by the headers
+/* --- Constants & Definitions --- */
+#define RESET_BUTTON_PIN 0  // BOOT button
+#define CONFIG_SSID "ESP32_Admin_Setup"
+
+// Define interface indexes (Standard for ESP32: STA=0, AP=1)
 #ifndef SOFTAP_IF
   #define SOFTAP_IF 1
 #endif
 
-#ifndef ST_IF
-  #define ST_IF 0
-#endif
-#define NAPT_IFACE_SOFTAP 1 
-#define NAPT_IFACE_STA    0
-/* --- Configuration & Pins --- */
-#define RESET_BUTTON_PIN 0  // BOOT button on most ESP32 boards
-#define CONFIG_SSID "ESP32_Admin_Setup"
-
-// Fallback sizes for the NAT table — SDK may already define these
+// NAT Table sizes
 #ifndef IP_NAPT_MAX
   #define IP_NAPT_MAX 512
 #endif
@@ -34,7 +32,6 @@ extern "C" {
 WebServer server(80);
 Preferences preferences;
 
-/* --- Global Settings --- */
 struct DeviceConfig {
     String sta_ssid;
     String sta_pass;
@@ -43,7 +40,7 @@ struct DeviceConfig {
     bool hide_ssid;
 } config;
 
-/* --- HTML (values pre-filled from stored config) --- */
+/* --- UI / HTML --- */
 String buildIndexHtml() {
     String html = F(R"=====(
 <!DOCTYPE html>
@@ -54,7 +51,7 @@ String buildIndexHtml() {
     <title>ESP32 Repeater Pro</title>
     <style>
         :root { --bg: #121212; --card: #1e1e1e; --text: #e0e0e0; --primary: #00adb5; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; display: flex; justify-content: center; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 450px; }
         .card { background: var(--card); padding: 25px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
         h2 { text-align: center; color: var(--primary); margin-bottom: 25px; }
@@ -64,11 +61,10 @@ String buildIndexHtml() {
             background: #252525; color: white; box-sizing: border-box;
         }
         .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
-        input[type='checkbox'] { width: 18px; height: 18px; cursor: pointer; }
         .btn {
             width: 100%; padding: 15px; border: none; border-radius: 8px;
             background: var(--primary); color: white; font-weight: bold; cursor: pointer; font-size: 1em;
-            transition: transform 0.2s, background 0.3s;
+            transition: 0.3s;
         }
         .btn:hover { background: #008f96; transform: translateY(-2px); }
         .footer { text-align: center; margin-top: 20px; font-size: 0.8em; color: #555; }
@@ -80,24 +76,24 @@ String buildIndexHtml() {
             <h2>Repeater Settings</h2>
             <form action='/save' method='POST'>
                 <label>Target Network (Uplink)</label>
-                <input name='s_sta' type='text' placeholder='Router SSID' value=)====="); // Hier Klammer zu!
-    html += config.sta_ssid;
+                <input name='s_sta' type='text' placeholder='Router SSID' value=)=====");
+    html += "\"" + config.sta_ssid + "\"";
     html += F(R"=====( required>
                 <input name='p_sta' type='password' placeholder='Router Password'>
 
                 <label>Broadcast Network (Downlink)</label>
-                <input name='s_ap' type='text' placeholder='New Network Name' value=)====="); // Hier Klammer zu!
-    html += config.ap_ssid;
+                <input name='s_ap' type='text' placeholder='New Network Name' value=)=====");
+    html += "\"" + config.ap_ssid + "\"";
     html += F(R"=====( required>
-                <input name='p_ap' type='password' placeholder='New Password (min. 8 chars)'>
+                <input name='p_ap' type='password' placeholder='New Password'>
 
                 <div class='checkbox-group'>
-                    <input name='hide' type='checkbox' id='hide')====="); // Hier Klammer zu!
+                    <input name='hide' type='checkbox' id='hide')=====");
     
     if (config.hide_ssid) html += F(" checked");
     
     html += F(R"=====(>
-                    <label for='hide'>Hide SSID (Hidden Network)</label>
+                    <label for='hide'>Hide SSID</label>
                 </div>
                 <button type='submit' class='btn'>Apply Settings</button>
             </form>
@@ -106,7 +102,7 @@ String buildIndexHtml() {
     </div>
 </body>
 </html>
-)====="); // Letztes Semikolon war wichtig
+)=====");
     return html;
 }
 
@@ -140,14 +136,12 @@ void handleSave() {
     preferences.putBool("hide", server.hasArg("hide"));
     preferences.end();
 
-    server.send(200, "text/plain",
-        "Settings saved. Restarting and connecting to: " + server.arg("s_sta"));
+    server.send(200, "text/plain", "Settings saved. Restarting...");
     delay(2000);
     ESP.restart();
 }
 
 void startConfigMode() {
-    Serial.println("Action: Starting AP Config Mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(CONFIG_SSID);
     server.on("/", []() { server.send(200, "text/html", buildIndexHtml()); });
@@ -157,7 +151,7 @@ void startConfigMode() {
 }
 
 void startRepeaterMode() {
-    Serial.printf("Action: Connecting to '%s'...\n", config.sta_ssid.c_str());
+    Serial.printf("Connecting to %s...\n", config.sta_ssid.c_str());
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin(config.sta_ssid.c_str(), config.sta_pass.c_str());
 
@@ -168,48 +162,31 @@ void startRepeaterMode() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\nFailed to connect. Reverting to Config Mode.");
+        Serial.println("\nConnection failed. Starting Config Mode.");
         startConfigMode();
         return;
     }
 
-    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-    
-    // Set up the AP
+    Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // Start the Access Point
     const char* ap_p = (config.ap_pass.length() >= 8) ? config.ap_pass.c_str() : nullptr;
     WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid ? 1 : 0);
 
-    // Initialize NAPT
-    // We use the literals or your build_flags here
+    /* --- NAPT Initialization --- */
+    // Initialize the NAPT table
     ip_napt_init(IP_NAPT_MAX, IP_PORT_MAX);
     
     // Enable NAPT on the SoftAP interface
     if (ip_napt_enable_no(SOFTAP_IF, 1) == ERR_OK) {
         Serial.println("NAPT enabled successfully.");
     } else {
-        Serial.println("NAPT failed to initialize.");
+        Serial.println("Failed to enable NAPT.");
     }
-
-    Serial.println("NAT Router is online.");
-}
-
-    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-    Serial.println("Starting NAT AP...");
-
-    // Open network if password too short for WPA2 (min 8 chars)
-    const char* ap_p = (config.ap_pass.length() >= 8) ? config.ap_pass.c_str() : nullptr;
-    WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid ? 1 : 0);
-
-    // Enable NAPT: allocate NAT table, then enable on the AP interface (SOFTAP_IF=1)
-    ip_napt_init(IP_NAPT_MAX, IP_PORT_MAX);
-    ip_napt_enable_no(SOFTAP_IF, 1);
-    Serial.println("NAPT enabled. NAT Router is online.");
-    Serial.printf("AP SSID: '%s'\n", config.ap_ssid.c_str());
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(200);
     pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
     loadConfig();
@@ -222,14 +199,13 @@ void setup() {
 }
 
 void loop() {
-    // WebServer only runs in Config Mode (pure WIFI_AP)
-    if (WiFi.getMode() == WIFI_AP) {
+    if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
         server.handleClient();
     }
 
-    // Long-press BOOT button (4 s) → wipe config
+    // Factory Reset check
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-        delay(50); // debounce
+        delay(50); 
         unsigned long pressStart = millis();
         while (digitalRead(RESET_BUTTON_PIN) == LOW) {
             if (millis() - pressStart > 4000) {
