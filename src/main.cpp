@@ -3,25 +3,25 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-/* * The ESP32 lwIP stack is written in C. 
- * We must use extern "C" to prevent C++ name mangling, 
- * otherwise the linker will not find the NAPT functions.
+/* * FORCE NAPT DEFINITIONS
+ * These must come before the lwip includes to ensure the headers 
+ * actually expose the functions.
  */
+#undef IP_NAPT
+#define IP_NAPT 1
+
 extern "C" {
-  #include <lwip/lwip_napt.h>
+  #include <lwip/ip4_napt.h>
   #include <lwip/err.h>
 }
 
-/* --- Constants & Definitions --- */
+/* --- Constants --- */
 #define RESET_BUTTON_PIN 0  // BOOT button
 #define CONFIG_SSID "ESP32_Admin_Setup"
 
-// Define interface indexes (Standard for ESP32: STA=0, AP=1)
-#ifndef SOFTAP_IF
-  #define SOFTAP_IF 1
-#endif
+// On ESP32: Station is interface 0, SoftAP is interface 1
+#define NAPT_IFACE_SOFTAP 1 
 
-// NAT Table sizes
 #ifndef IP_NAPT_MAX
   #define IP_NAPT_MAX 512
 #endif
@@ -142,6 +142,7 @@ void handleSave() {
 }
 
 void startConfigMode() {
+    Serial.println("Starting AP Config Mode...");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(CONFIG_SSID);
     server.on("/", []() { server.send(200, "text/html", buildIndexHtml()); });
@@ -173,12 +174,11 @@ void startRepeaterMode() {
     const char* ap_p = (config.ap_pass.length() >= 8) ? config.ap_pass.c_str() : nullptr;
     WiFi.softAP(config.ap_ssid.c_str(), ap_p, 1, config.hide_ssid ? 1 : 0);
 
-    /* --- NAPT Initialization --- */
     // Initialize the NAPT table
     ip_napt_init(IP_NAPT_MAX, IP_PORT_MAX);
     
-    // Enable NAPT on the SoftAP interface
-    if (ip_napt_enable_no(SOFTAP_IF, 1) == ERR_OK) {
+    // Enable NAPT on the SoftAP interface (Interface index 1)
+    if (ip_napt_enable_no(NAPT_IFACE_SOFTAP, 1) == ERR_OK) {
         Serial.println("NAPT enabled successfully.");
     } else {
         Serial.println("Failed to enable NAPT.");
@@ -187,6 +187,7 @@ void startRepeaterMode() {
 
 void setup() {
     Serial.begin(115200);
+    delay(500); // Give serial some time
     pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
 
     loadConfig();
@@ -199,9 +200,8 @@ void setup() {
 }
 
 void loop() {
-    if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
-        server.handleClient();
-    }
+    // WebServer runs in both modes to allow reconfiguration
+    server.handleClient();
 
     // Factory Reset check
     if (digitalRead(RESET_BUTTON_PIN) == LOW) {
