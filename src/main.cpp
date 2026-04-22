@@ -3,15 +3,16 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-// ESP-IDF 4.4 NAPT API — framework-arduinoespressif32 @ 2.0.14 (espressif32@6.5.0)
-// ip4_napt.h exposes ip_napt_init() and ip_napt_enable_no().
-// lwip_napt.h defines SOFTAP_IF (= 1, the AP interface index).
-// Both headers are guarded by IP_NAPT, which the prebuilt SDK lwipopts.h sets
-// to CONFIG_LWIP_IPV4_NAPT — already enabled in this SDK build.
-#include "lwip/ip4_napt.h"
-#include "lwip/lwip_napt.h"
+// Force C linkage for lwIP functions
+extern "C" {
 #include <lwip/lwip_napt.h>
 #include <lwip/err.h>
+}
+
+// Ensure SOFTAP_IF is defined for the ESP32
+#ifndef SOFTAP_IF
+  #define SOFTAP_IF 1
+#endif
 
 // If SOFTAP_IF is still not recognized, define it or use the ESP-IDF constant
 #define NAPT_IFACE_SOFTAP 1 
