@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_wifi.h"
@@ -10,72 +11,135 @@
 #include "driver/gpio.h"
 
 #define RESET_PIN 4
+#define MAX_NETWORKS 5
 
 static const char *TAG = "repeater";
 
 httpd_handle_t server;
 esp_netif_t *ap_netif;
 
-/* ================= CONFIG ================= */
+/* ================= STORAGE ================= */
 
 typedef struct {
     char ssid[32];
     char pass[64];
 } wifi_cfg_t;
 
-wifi_cfg_t saved;
+wifi_cfg_t networks[MAX_NETWORKS];
+int network_count = 0;
 
 /* ================= NVS ================= */
 
 void load_config() {
     nvs_handle_t nvs;
     if (nvs_open("cfg", NVS_READONLY, &nvs) == ESP_OK) {
-        size_t l1 = sizeof(saved.ssid);
-        size_t l2 = sizeof(saved.pass);
-        nvs_get_str(nvs, "s", saved.ssid, &l1);
-        nvs_get_str(nvs, "p", saved.pass, &l2);
+        nvs_get_i32(nvs, "count", &network_count);
+
+        for (int i = 0; i < network_count; i++) {
+            char key_s[10], key_p[10];
+            sprintf(key_s, "s%d", i);
+            sprintf(key_p, "p%d", i);
+
+            size_t l1 = sizeof(networks[i].ssid);
+            size_t l2 = sizeof(networks[i].pass);
+
+            nvs_get_str(nvs, key_s, networks[i].ssid, &l1);
+            nvs_get_str(nvs, key_p, networks[i].pass, &l2);
+        }
+
         nvs_close(nvs);
     }
 }
 
-void save_config(const char* s, const char* p) {
+void save_network(const char* s, const char* p) {
+    if (network_count >= MAX_NETWORKS) network_count = 0;
+
+    strcpy(networks[network_count].ssid, s);
+    strcpy(networks[network_count].pass, p);
+    network_count++;
+
     nvs_handle_t nvs;
     nvs_open("cfg", NVS_READWRITE, &nvs);
-    nvs_set_str(nvs, "s", s);
-    nvs_set_str(nvs, "p", p);
+
+    nvs_set_i32(nvs, "count", network_count);
+
+    for (int i = 0; i < network_count; i++) {
+        char key_s[10], key_p[10];
+        sprintf(key_s, "s%d", i);
+        sprintf(key_p, "p%d", i);
+
+        nvs_set_str(nvs, key_s, networks[i].ssid);
+        nvs_set_str(nvs, key_p, networks[i].pass);
+    }
+
     nvs_commit(nvs);
     nvs_close(nvs);
 }
 
 /* ================= WIFI ================= */
 
-static int retry_count = 0;
+int retry_count = 0;
+
+void connect_best_network()
+{
+    wifi_scan_config_t scan = {0};
+    esp_wifi_scan_start(&scan, true);
+
+    uint16_t count = 20;
+    wifi_ap_record_t list[20];
+    esp_wifi_scan_get_ap_records(&count, list);
+
+    int best = -1;
+    int best_rssi = -999;
+
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < network_count; j++) {
+            if (strcmp((char*)list[i].ssid, networks[j].ssid) == 0) {
+                if (list[i].rssi > best_rssi) {
+                    best_rssi = list[i].rssi;
+                    best = j;
+                }
+            }
+        }
+    }
+
+    if (best >= 0) {
+        wifi_config_t sta = {0};
+        strcpy((char*)sta.sta.ssid, networks[best].ssid);
+        strcpy((char*)sta.sta.password, networks[best].pass);
+
+        esp_wifi_set_config(WIFI_IF_STA, &sta);
+        esp_wifi_connect();
+
+        ESP_LOGI(TAG, "Connecting to best network: %s", networks[best].ssid);
+    } else {
+        ESP_LOGW(TAG, "No known network found");
+    }
+}
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        connect_best_network();
     }
 
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         if (retry_count < 10) {
-            esp_wifi_connect();
             retry_count++;
-            ESP_LOGW(TAG, "Reconnect attempt %d", retry_count);
+            connect_best_network();
         } else {
-            ESP_LOGE(TAG, "Reconnect failed, restarting...");
-            esp_restart();
+            ESP_LOGE(TAG, "Reconnect failed, fallback AP only");
         }
     }
 
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         retry_count = 0;
-        ESP_LOGI(TAG, "Connected with IP");
+        ESP_LOGI(TAG, "Connected!");
     }
 }
 
-void start_wifi_apsta(const char* ssid, const char* pass)
+void start_wifi()
 {
     esp_netif_create_default_wifi_sta();
     ap_netif = esp_netif_create_default_wifi_ap();
@@ -85,10 +149,6 @@ void start_wifi_apsta(const char* ssid, const char* pass)
 
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
-
-    wifi_config_t sta = {0};
-    strcpy((char*)sta.sta.ssid, ssid);
-    strcpy((char*)sta.sta.password, pass);
 
     wifi_config_t ap = {
         .ap = {
@@ -100,9 +160,7 @@ void start_wifi_apsta(const char* ssid, const char* pass)
     };
 
     esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_set_config(WIFI_IF_STA, &sta);
     esp_wifi_set_config(WIFI_IF_AP, &ap);
-
     esp_wifi_start();
 
     esp_netif_napt_enable(ap_netif);
@@ -110,7 +168,7 @@ void start_wifi_apsta(const char* ssid, const char* pass)
 
 /* ================= SCAN ================= */
 
-char scan_json[2048];
+char scan_json[4096];
 
 void scan_networks() {
     wifi_scan_config_t scan = {0};
@@ -124,7 +182,9 @@ void scan_networks() {
 
     for (int i = 0; i < count; i++) {
         char line[128];
-        sprintf(line, "\"%s\"%s", list[i].ssid, (i < count - 1) ? "," : "");
+        sprintf(line, "{\"ssid\":\"%s\",\"rssi\":%d}%s",
+                list[i].ssid, list[i].rssi,
+                (i < count - 1) ? "," : "");
         strcat(scan_json, line);
     }
 
@@ -136,17 +196,23 @@ void scan_networks() {
 esp_err_t root_get(httpd_req_t *req)
 {
     const char* html =
-    "<!DOCTYPE html><html><body>"
-    "<h2>ESP32 Repeater</h2>"
-    "<button onclick='scan()'>Scan</button><br><br>"
-    "<select id='net'></select><br>"
-    "PASS:<input id='p'><br>"
-    "<button onclick='save()'>Connect</button>"
-    "<script>"
-    "function scan(){fetch('/scan').then(r=>r.json()).then(d=>{let s=document.getElementById('net');s.innerHTML='';d.forEach(n=>{let o=document.createElement('option');o.text=n;s.add(o);});});}"
-    "function save(){fetch('/save',{method:'POST',body:'s='+net.value+'&p='+p.value});}"
-    "</script>"
-    "</body></html>";
+"<!DOCTYPE html><html><head><style>"
+"body{background:#121212;color:#fff;font-family:sans-serif;padding:20px}"
+".card{background:#1e1e1e;padding:20px;border-radius:10px}"
+"button{padding:10px;background:#00adb5;border:none;color:white}"
+"</style></head><body>"
+"<div class='card'>"
+"<h2>ESP32 Repeater</h2>"
+"<button onclick='scan()'>Scan</button><br><br>"
+"<select id='net'></select><br>"
+"PASS:<input id='p'><br><br>"
+"<button onclick='save()'>Add Network</button>"
+"</div>"
+"<script>"
+"function scan(){fetch('/scan').then(r=>r.json()).then(d=>{let s=document.getElementById('net');s.innerHTML='';d.sort((a,b)=>b.rssi-a.rssi);d.forEach(n=>{let o=document.createElement('option');o.text=n.ssid+' ('+n.rssi+')';o.value=n.ssid;s.add(o);});});}"
+"function save(){fetch('/save',{method:'POST',body:'s='+net.value+'&p='+p.value});}"
+"</script>"
+"</body></html>";
 
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -169,10 +235,9 @@ esp_err_t save_post(httpd_req_t *req)
     char ssid[32] = {0}, pass[64] = {0};
     sscanf(buf, "s=%31[^&]&p=%63s", ssid, pass);
 
-    save_config(ssid, pass);
+    save_network(ssid, pass);
 
-    httpd_resp_sendstr(req, "Saved. Rebooting...");
-    esp_restart();
+    httpd_resp_sendstr(req, "Saved");
     return ESP_OK;
 }
 
@@ -218,8 +283,7 @@ void app_main(void)
 
     load_config();
 
-    start_wifi_apsta(saved.ssid, saved.pass);
-
+    start_wifi();
     start_web();
 
     xTaskCreate(reset_task, "reset", 2048, NULL, 5, NULL);
