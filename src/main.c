@@ -7,16 +7,14 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "lwip/sockets.h"
-#include "lwip/inet.h"
 #include "driver/gpio.h"
 
 #define RESET_PIN 4
-#define SCAN_ENABLE_PIN 5
 
 static const char *TAG = "repeater";
 
 httpd_handle_t server;
+esp_netif_t *ap_netif;
 
 /* ================= CONFIG ================= */
 
@@ -32,10 +30,10 @@ wifi_cfg_t saved;
 void load_config() {
     nvs_handle_t nvs;
     if (nvs_open("cfg", NVS_READONLY, &nvs) == ESP_OK) {
-        size_t len1 = sizeof(saved.ssid);
-        size_t len2 = sizeof(saved.pass);
-        nvs_get_str(nvs, "s", saved.ssid, &len1);
-        nvs_get_str(nvs, "p", saved.pass, &len2);
+        size_t l1 = sizeof(saved.ssid);
+        size_t l2 = sizeof(saved.pass);
+        nvs_get_str(nvs, "s", saved.ssid, &l1);
+        nvs_get_str(nvs, "p", saved.pass, &l2);
         nvs_close(nvs);
     }
 }
@@ -51,7 +49,31 @@ void save_config(const char* s, const char* p) {
 
 /* ================= WIFI ================= */
 
-esp_netif_t *ap_netif;
+static int retry_count = 0;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    }
+
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (retry_count < 10) {
+            esp_wifi_connect();
+            retry_count++;
+            ESP_LOGW(TAG, "Reconnect attempt %d", retry_count);
+        } else {
+            ESP_LOGE(TAG, "Reconnect failed, restarting...");
+            esp_restart();
+        }
+    }
+
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        retry_count = 0;
+        ESP_LOGI(TAG, "Connected with IP");
+    }
+}
 
 void start_wifi_apsta(const char* ssid, const char* pass)
 {
@@ -60,6 +82,9 @@ void start_wifi_apsta(const char* ssid, const char* pass)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
 
     wifi_config_t sta = {0};
     strcpy((char*)sta.sta.ssid, ssid);
@@ -88,12 +113,6 @@ void start_wifi_apsta(const char* ssid, const char* pass)
 char scan_json[2048];
 
 void scan_networks() {
-
-    if (gpio_get_level(SCAN_ENABLE_PIN) == 1) {
-        strcpy(scan_json, "[]");
-        return;
-    }
-
     wifi_scan_config_t scan = {0};
     esp_wifi_scan_start(&scan, true);
 
@@ -152,7 +171,7 @@ esp_err_t save_post(httpd_req_t *req)
 
     save_config(ssid, pass);
 
-    httpd_resp_sendstr(req, "OK reboot");
+    httpd_resp_sendstr(req, "Saved. Rebooting...");
     esp_restart();
     return ESP_OK;
 }
@@ -170,36 +189,6 @@ void start_web()
     httpd_register_uri_handler(server, &s);
     httpd_register_uri_handler(server, &p);
 }
-
-/* ================= DNS (DISABLED) ================= */
-
-/*
-void dns_task()
-{
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-
-    struct sockaddr_in addr;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(53);
-
-    bind(sock, (struct sockaddr*)&addr, sizeof(addr));
-
-    while (1) {
-        char buf[512];
-        struct sockaddr_in client;
-        socklen_t len = sizeof(client);
-
-        int r = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr*)&client, &len);
-
-        if (r > 0) {
-            buf[2] |= 0x80;
-            buf[3] |= 0x80;
-            sendto(sock, buf, r, 0, (struct sockaddr*)&client, len);
-        }
-    }
-}
-*/
 
 /* ================= RESET ================= */
 
@@ -227,18 +216,11 @@ void app_main(void)
     esp_netif_init();
     esp_event_loop_create_default();
 
-    gpio_set_direction(SCAN_ENABLE_PIN, GPIO_MODE_INPUT);
-
     load_config();
 
-    if (strlen(saved.ssid) > 0) {
-        start_wifi_apsta(saved.ssid, saved.pass);
-    } else {
-        start_wifi_apsta("", "");
-    }
+    start_wifi_apsta(saved.ssid, saved.pass);
 
     start_web();
 
-    // xTaskCreate(dns_task, "dns", 4096, NULL, 5, NULL);
     xTaskCreate(reset_task, "reset", 2048, NULL, 5, NULL);
 }
