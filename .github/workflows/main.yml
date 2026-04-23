@@ -10,10 +10,15 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Berechtigungen setzen, damit das Action-Token Tags pushen und Releases erstellen darf
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Wichtig für Tagging
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -54,8 +59,20 @@ jobs:
           path: .pio/build/esp32/firmware.bin
           if-no-files-found: error
 
+      # Schritt zum Generieren eines automatischen Tags
+      - name: Generate Tag Name
+        id: tagger
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          TAG_NAME="v$(date +'%Y.%m.%d')-${{ github.run_number }}"
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "Neuer Tag: $TAG_NAME"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         with:
+          tag_name: ${{ steps.tagger.outputs.tag }}
+          name: Release ${{ steps.tagger.outputs.tag }}
           files: .pio/build/esp32/firmware.bin
+          generate_release_notes: true
