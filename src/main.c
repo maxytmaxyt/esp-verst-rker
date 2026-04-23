@@ -26,7 +26,7 @@ typedef struct {
 } wifi_cfg_t;
 
 wifi_cfg_t networks[MAX_NETWORKS];
-int network_count = 0;
+int32_t network_count = 0;
 
 /* ================= NVS ================= */
 
