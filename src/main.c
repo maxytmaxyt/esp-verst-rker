@@ -11,7 +11,8 @@
 #include "lwip/inet.h"
 #include "driver/gpio.h"
 
-#define RESET_PIN 0
+#define RESET_PIN 4
+#define SCAN_ENABLE_PIN 5
 
 static const char *TAG = "repeater";
 
@@ -87,6 +88,12 @@ void start_wifi_apsta(const char* ssid, const char* pass)
 char scan_json[2048];
 
 void scan_networks() {
+
+    if (gpio_get_level(SCAN_ENABLE_PIN) == 1) {
+        strcpy(scan_json, "[]");
+        return;
+    }
+
     wifi_scan_config_t scan = {0};
     esp_wifi_scan_start(&scan, true);
 
@@ -164,8 +171,9 @@ void start_web()
     httpd_register_uri_handler(server, &p);
 }
 
-/* ================= DNS ================= */
+/* ================= DNS (DISABLED) ================= */
 
+/*
 void dns_task()
 {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -191,6 +199,7 @@ void dns_task()
         }
     }
 }
+*/
 
 /* ================= RESET ================= */
 
@@ -218,6 +227,8 @@ void app_main(void)
     esp_netif_init();
     esp_event_loop_create_default();
 
+    gpio_set_direction(SCAN_ENABLE_PIN, GPIO_MODE_INPUT);
+
     load_config();
 
     if (strlen(saved.ssid) > 0) {
@@ -228,6 +239,6 @@ void app_main(void)
 
     start_web();
 
-    xTaskCreate(dns_task, "dns", 4096, NULL, 5, NULL);
+    // xTaskCreate(dns_task, "dns", 4096, NULL, 5, NULL);
     xTaskCreate(reset_task, "reset", 2048, NULL, 5, NULL);
 }
