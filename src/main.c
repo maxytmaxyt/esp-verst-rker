@@ -33,12 +33,21 @@ int32_t network_count = 0;
 void load_config() {
     nvs_handle_t nvs;
     if (nvs_open("cfg", NVS_READONLY, &nvs) == ESP_OK) {
-        nvs_get_i32(nvs, "count", &network_count);
+
+        if (nvs_get_i32(nvs, "count", &network_count) != ESP_OK) {
+            network_count = 0;
+        }
+
+        if (network_count > MAX_NETWORKS || network_count < 0) {
+            network_count = 0;
+        }
 
         for (int i = 0; i < network_count; i++) {
-            char key_s[10], key_p[10];
-            sprintf(key_s, "s%d", i);
-            sprintf(key_p, "p%d", i);
+            char key_s[16];
+            char key_p[16];
+
+            snprintf(key_s, sizeof(key_s), "s%d", i);
+            snprintf(key_p, sizeof(key_p), "p%d", i);
 
             size_t l1 = sizeof(networks[i].ssid);
             size_t l2 = sizeof(networks[i].pass);
@@ -64,9 +73,11 @@ void save_network(const char* s, const char* p) {
     nvs_set_i32(nvs, "count", network_count);
 
     for (int i = 0; i < network_count; i++) {
-        char key_s[10], key_p[10];
-        sprintf(key_s, "s%d", i);
-        sprintf(key_p, "p%d", i);
+        char key_s[16];
+        char key_p[16];
+
+        snprintf(key_s, sizeof(key_s), "s%d", i);
+        snprintf(key_p, sizeof(key_p), "p%d", i);
 
         nvs_set_str(nvs, key_s, networks[i].ssid);
         nvs_set_str(nvs, key_p, networks[i].pass);
@@ -111,7 +122,7 @@ void connect_best_network()
         esp_wifi_set_config(WIFI_IF_STA, &sta);
         esp_wifi_connect();
 
-        ESP_LOGI(TAG, "Connecting to best network: %s", networks[best].ssid);
+        ESP_LOGI(TAG, "Connecting to: %s", networks[best].ssid);
     } else {
         ESP_LOGW(TAG, "No known network found");
     }
@@ -182,9 +193,11 @@ void scan_networks() {
 
     for (int i = 0; i < count; i++) {
         char line[128];
-        sprintf(line, "{\"ssid\":\"%s\",\"rssi\":%d}%s",
-                list[i].ssid, list[i].rssi,
-                (i < count - 1) ? "," : "");
+        snprintf(line, sizeof(line),
+            "{\"ssid\":\"%s\",\"rssi\":%d}%s",
+            list[i].ssid, list[i].rssi,
+            (i < count - 1) ? "," : "");
+
         strcat(scan_json, line);
     }
 
