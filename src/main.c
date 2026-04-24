@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_wifi.h"
@@ -10,228 +14,365 @@
 #include "esp_log.h"
 #include "driver/gpio.h"
 
-#define RESET_PIN 4
-#define MAX_NETWORKS 5
+/* ================================================
+   CONFIG
+   ================================================ */
+
+#define RESET_PIN        4
+#define MAX_NETWORKS     5
+#define MAX_AP_RECORDS   20
+
+/* Event-Bits für den WiFi-Manager-Task */
+#define BIT_DO_CONNECT   BIT0
+#define BIT_CONNECTED    BIT1
 
 static const char *TAG = "repeater";
 
-httpd_handle_t server;
-esp_netif_t *ap_netif;
+/* ================================================
+   GLOBALS
+   ================================================ */
 
-/* ================= STORAGE ================= */
+static httpd_handle_t       server;
+static esp_netif_t         *ap_netif;
+static EventGroupHandle_t   s_wifi_eg;
+static SemaphoreHandle_t    s_scan_mutex;   /* Fix 5: Kein gleichzeitiger Scan */
+static int                  retry_count = 0;
+
+/* ================================================
+   STORAGE
+   ================================================ */
 
 typedef struct {
     char ssid[32];
     char pass[64];
 } wifi_cfg_t;
 
-wifi_cfg_t networks[MAX_NETWORKS];
-int32_t network_count = 0;
+static wifi_cfg_t networks[MAX_NETWORKS];
+static int32_t    network_count = 0;
 
-/* ================= NVS ================= */
+/* ================================================
+   NVS
+   ================================================ */
 
-void load_config() {
+static void load_config(void)
+{
     nvs_handle_t nvs;
-    if (nvs_open("cfg", NVS_READONLY, &nvs) == ESP_OK) {
+    if (nvs_open("cfg", NVS_READONLY, &nvs) != ESP_OK) return;
 
-        if (nvs_get_i32(nvs, "count", &network_count) != ESP_OK) {
-            network_count = 0;
-        }
+    if (nvs_get_i32(nvs, "count", &network_count) != ESP_OK)
+        network_count = 0;
 
-        if (network_count > MAX_NETWORKS || network_count < 0) {
-            network_count = 0;
-        }
+    if (network_count > MAX_NETWORKS || network_count < 0)
+        network_count = 0;
 
-        for (int i = 0; i < network_count; i++) {
-            char key_s[16];
-            char key_p[16];
-
-            snprintf(key_s, sizeof(key_s), "s%d", i);
-            snprintf(key_p, sizeof(key_p), "p%d", i);
-
-            size_t l1 = sizeof(networks[i].ssid);
-            size_t l2 = sizeof(networks[i].pass);
-
-            nvs_get_str(nvs, key_s, networks[i].ssid, &l1);
-            nvs_get_str(nvs, key_p, networks[i].pass, &l2);
-        }
-
-        nvs_close(nvs);
+    for (int i = 0; i < network_count; i++) {
+        char key_s[8], key_p[8];
+        snprintf(key_s, sizeof(key_s), "s%d", i);
+        snprintf(key_p, sizeof(key_p), "p%d", i);
+        size_t l1 = sizeof(networks[i].ssid);
+        size_t l2 = sizeof(networks[i].pass);
+        nvs_get_str(nvs, key_s, networks[i].ssid, &l1);
+        nvs_get_str(nvs, key_p, networks[i].pass, &l2);
     }
+
+    nvs_close(nvs);
 }
 
-void save_network(const char* s, const char* p) {
+static void save_network(const char *s, const char *p)
+{
     if (network_count >= MAX_NETWORKS) network_count = 0;
 
-    strcpy(networks[network_count].ssid, s);
-    strcpy(networks[network_count].pass, p);
+    /* Fix 5: strlcpy statt strcpy – verhindert Buffer Overflow */
+    strlcpy(networks[network_count].ssid, s, sizeof(networks[network_count].ssid));
+    strlcpy(networks[network_count].pass, p, sizeof(networks[network_count].pass));
     network_count++;
 
     nvs_handle_t nvs;
-    nvs_open("cfg", NVS_READWRITE, &nvs);
+    if (nvs_open("cfg", NVS_READWRITE, &nvs) != ESP_OK) return;
 
     nvs_set_i32(nvs, "count", network_count);
-
     for (int i = 0; i < network_count; i++) {
-        char key_s[16];
-        char key_p[16];
-
+        char key_s[8], key_p[8];
         snprintf(key_s, sizeof(key_s), "s%d", i);
         snprintf(key_p, sizeof(key_p), "p%d", i);
-
         nvs_set_str(nvs, key_s, networks[i].ssid);
         nvs_set_str(nvs, key_p, networks[i].pass);
     }
-
     nvs_commit(nvs);
     nvs_close(nvs);
 }
 
-/* ================= WIFI ================= */
+/* ================================================
+   WIFI CORE – nur vom Manager-Task aufzurufen!
+   ================================================ */
 
-int retry_count = 0;
-
-void connect_best_network()
+/*
+ * Fix 1: AP-Liste per malloc auf dem Heap statt auf dem Stack.
+ *   wifi_ap_record_t list[20] = ~1760 Bytes auf dem Stack –
+ *   im WiFi-Event-Task (3 KB Stack) → Stack Overflow.
+ *
+ * Fix 2 + Fix 3: Diese Funktion wird NICHT mehr aus dem Event-Handler
+ *   aufgerufen. Der Event-Handler setzt nur ein Bit; der Manager-Task
+ *   führt den Scan blockend durch. Kein Blocking im WiFi-System-Task,
+ *   keine Disconnect→Scan→Disconnect-Schleife mehr.
+ */
+static void do_scan_and_connect(void)
 {
-    wifi_scan_config_t scan = {0};
-    esp_wifi_scan_start(&scan, true);
+    /* Fix 5: Scan-Mutex – verhindert gleichzeitigen Scan vom HTTP-Handler */
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(8000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Scan mutex timeout, skipping connect scan");
+        return;
+    }
 
-    uint16_t count = 20;
-    wifi_ap_record_t list[20];
+    wifi_ap_record_t *list = malloc(MAX_AP_RECORDS * sizeof(wifi_ap_record_t));
+    if (!list) {
+        ESP_LOGE(TAG, "malloc AP list failed");
+        xSemaphoreGive(s_scan_mutex);
+        return;
+    }
+
+    wifi_scan_config_t scan_cfg = {0};
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true); /* blocking OK hier */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Scan failed: %s", esp_err_to_name(err));
+        free(list);
+        xSemaphoreGive(s_scan_mutex);
+        return;
+    }
+
+    uint16_t count = MAX_AP_RECORDS;
     esp_wifi_scan_get_ap_records(&count, list);
 
-    int best = -1;
-    int best_rssi = -999;
-
+    int best = -1, best_rssi = -999;
     for (int i = 0; i < count; i++) {
         for (int j = 0; j < network_count; j++) {
-            if (strcmp((char*)list[i].ssid, networks[j].ssid) == 0) {
-                if (list[i].rssi > best_rssi) {
-                    best_rssi = list[i].rssi;
-                    best = j;
-                }
+            if (strcmp((char *)list[i].ssid, networks[j].ssid) == 0 &&
+                list[i].rssi > best_rssi) {
+                best_rssi = list[i].rssi;
+                best = j;
             }
         }
     }
 
+    free(list);
+    xSemaphoreGive(s_scan_mutex);
+
     if (best >= 0) {
         wifi_config_t sta = {0};
-        strcpy((char*)sta.sta.ssid, networks[best].ssid);
-        strcpy((char*)sta.sta.password, networks[best].pass);
-
+        strlcpy((char *)sta.sta.ssid,     networks[best].ssid, sizeof(sta.sta.ssid));
+        strlcpy((char *)sta.sta.password, networks[best].pass, sizeof(sta.sta.password));
+        /* Fix 5: Disconnect + kurze Pause vor erneutem Connect (Driver flush) */
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(100));
         esp_wifi_set_config(WIFI_IF_STA, &sta);
         esp_wifi_connect();
-
-        ESP_LOGI(TAG, "Connecting to: %s", networks[best].ssid);
+        ESP_LOGI(TAG, "Connecting to: %s (RSSI %d)", networks[best].ssid, best_rssi);
     } else {
-        ESP_LOGW(TAG, "No known network found");
+        ESP_LOGW(TAG, "No known network in range");
     }
 }
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        connect_best_network();
-    }
+/* ================================================
+   WIFI MANAGER TASK
+   ================================================ */
 
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (retry_count < 10) {
-            retry_count++;
-            connect_best_network();
-        } else {
-            ESP_LOGE(TAG, "Reconnect failed, fallback AP only");
+/*
+ * Fix 1: Eigener Task mit 8 KB Stack.
+ * Fix 2: Wartet 1 s nach WiFi-Start bevor der erste Scan läuft
+ *         (WiFi-Stack braucht Zeit zum Initialisieren).
+ * Fix 3: Event-Handler setzt nur BIT_DO_CONNECT; dieser Task
+ *         führt den blockenden Scan durch → keine Reconnect-Schleife.
+ */
+static void wifi_manager_task(void *arg)
+{
+    /* Erster Connect-Versuch nach kurzem Delay */
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    do_scan_and_connect();
+
+    while (1) {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_eg, BIT_DO_CONNECT,
+            pdTRUE,   /* Bit nach Lesen löschen */
+            pdFALSE,
+            portMAX_DELAY);
+
+        if (bits & BIT_DO_CONNECT) {
+            /* Exponentielles Backoff: max. 30 s */
+            int delay_s = (retry_count < 10) ? retry_count * 3 : 30;
+            if (delay_s > 0) {
+                ESP_LOGI(TAG, "Reconnect in %d s (retry %d)", delay_s, retry_count);
+                vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
+            }
+            do_scan_and_connect();
         }
     }
+}
 
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+/* ================================================
+   WIFI EVENT HANDLER
+   ================================================ */
+
+/*
+ * Fix 3: Event-Handler tut NICHTS Blockierendes mehr.
+ *   Kein esp_wifi_scan_start(), kein esp_wifi_connect() direkt.
+ *   Nur Bit setzen → Manager-Task übernimmt.
+ */
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_eg, BIT_CONNECTED);
+        if (retry_count < 15) {
+            retry_count++;
+            xEventGroupSetBits(s_wifi_eg, BIT_DO_CONNECT);
+        } else {
+            ESP_LOGE(TAG, "Max retries reached – AP-only mode");
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         retry_count = 0;
-        ESP_LOGI(TAG, "Connected!");
+        xEventGroupSetBits(s_wifi_eg, BIT_CONNECTED);
+        ESP_LOGI(TAG, "STA connected, got IP");
     }
 }
 
-void start_wifi()
+/* ================================================
+   WIFI INIT
+   ================================================ */
+
+static void start_wifi(void)
 {
+    s_wifi_eg    = xEventGroupCreate();
+    s_scan_mutex = xSemaphoreCreateMutex();
+
     esp_netif_create_default_wifi_sta();
     ap_netif = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    /* Fix 5: Storage RAM – kein häufiges Flash-Schreiben beim Reconnect */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
-    wifi_config_t ap = {
+    /* Nur die Events registrieren, die wir wirklich brauchen */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+
+    wifi_config_t ap_cfg = {
         .ap = {
-            .ssid = "ESP32_Repeater",
-            .password = "12345678",
+            .ssid           = "ESP32_Repeater",
+            .password       = "12345678",
             .max_connection = 4,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK
-        }
+            .authmode       = WIFI_AUTH_WPA_WPA2_PSK,
+        },
     };
 
-    esp_wifi_set_mode(WIFI_MODE_APSTA);
-    esp_wifi_set_config(WIFI_IF_AP, &ap);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
 
     esp_netif_napt_enable(ap_netif);
+
+    /* Fix 1: Manager-Task mit 8 KB Stack */
+    xTaskCreate(wifi_manager_task, "wifi_mgr", 8192, NULL, 5, NULL);
 }
 
-/* ================= SCAN ================= */
+/* ================================================
+   HTTP SCAN (vom httpd-Task aufgerufen)
+   ================================================ */
 
-char scan_json[4096];
+static char scan_json[4096]; /* global – nicht auf dem Stack */
 
-void scan_networks() {
-    wifi_scan_config_t scan = {0};
-    esp_wifi_scan_start(&scan, true);
-
-    uint16_t count = 20;
-    wifi_ap_record_t list[20];
-    esp_wifi_scan_get_ap_records(&count, list);
-
-    strcpy(scan_json, "[");
-
-    for (int i = 0; i < count; i++) {
-        char line[128];
-        snprintf(line, sizeof(line),
-            "{\"ssid\":\"%s\",\"rssi\":%d}%s",
-            list[i].ssid, list[i].rssi,
-            (i < count - 1) ? "," : "");
-
-        strcat(scan_json, line);
+static void scan_networks(void)
+{
+    /* Fix 5: Mutex gegen gleichzeitigen Scan aus dem Manager-Task */
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        strlcpy(scan_json, "[]", sizeof(scan_json));
+        return;
     }
 
-    strcat(scan_json, "]");
+    /* Fix 1: Heap statt Stack */
+    wifi_ap_record_t *list = malloc(MAX_AP_RECORDS * sizeof(wifi_ap_record_t));
+    if (!list) {
+        strlcpy(scan_json, "[]", sizeof(scan_json));
+        xSemaphoreGive(s_scan_mutex);
+        return;
+    }
+
+    wifi_scan_config_t scan_cfg = {0};
+    if (esp_wifi_scan_start(&scan_cfg, true) != ESP_OK) {
+        strlcpy(scan_json, "[]", sizeof(scan_json));
+        free(list);
+        xSemaphoreGive(s_scan_mutex);
+        return;
+    }
+
+    uint16_t count = MAX_AP_RECORDS;
+    esp_wifi_scan_get_ap_records(&count, list);
+
+    /* Puffer-sicheres Aufbauen des JSON */
+    int off = 0;
+    off += snprintf(scan_json + off, sizeof(scan_json) - off, "[");
+    for (int i = 0; i < count; i++) {
+        if (off >= (int)sizeof(scan_json) - 80) break;
+        off += snprintf(scan_json + off, sizeof(scan_json) - off,
+                        "{\"ssid\":\"%s\",\"rssi\":%d}%s",
+                        list[i].ssid, list[i].rssi,
+                        (i < count - 1) ? "," : "");
+    }
+    snprintf(scan_json + off, sizeof(scan_json) - off, "]");
+
+    free(list);
+    xSemaphoreGive(s_scan_mutex);
 }
 
-/* ================= WEB ================= */
+/* ================================================
+   HTTP HANDLER
+   ================================================ */
 
-esp_err_t root_get(httpd_req_t *req)
+static esp_err_t root_get(httpd_req_t *req)
 {
-    const char* html =
-"<!DOCTYPE html><html><head><style>"
-"body{background:#121212;color:#fff;font-family:sans-serif;padding:20px}"
-".card{background:#1e1e1e;padding:20px;border-radius:10px}"
-"button{padding:10px;background:#00adb5;border:none;color:white}"
-"</style></head><body>"
-"<div class='card'>"
-"<h2>ESP32 Repeater</h2>"
-"<button onclick='scan()'>Scan</button><br><br>"
-"<select id='net'></select><br>"
-"PASS:<input id='p'><br><br>"
-"<button onclick='save()'>Add Network</button>"
-"</div>"
-"<script>"
-"function scan(){fetch('/scan').then(r=>r.json()).then(d=>{let s=document.getElementById('net');s.innerHTML='';d.sort((a,b)=>b.rssi-a.rssi);d.forEach(n=>{let o=document.createElement('option');o.text=n.ssid+' ('+n.rssi+')';o.value=n.ssid;s.add(o);});});}"
-"function save(){fetch('/save',{method:'POST',body:'s='+net.value+'&p='+p.value});}"
-"</script>"
-"</body></html>";
+    const char *html =
+        "<!DOCTYPE html><html><head><style>"
+        "body{background:#121212;color:#fff;font-family:sans-serif;padding:20px}"
+        ".card{background:#1e1e1e;padding:20px;border-radius:10px}"
+        "button{padding:10px;background:#00adb5;border:none;color:white;cursor:pointer}"
+        "select,input{margin:6px 0;padding:6px;width:100%;box-sizing:border-box}"
+        "</style></head><body>"
+        "<div class='card'>"
+        "<h2>ESP32 Repeater</h2>"
+        "<button onclick='scan()'>Scan</button><br><br>"
+        "<select id='net'></select>"
+        "<input id='p' placeholder='Password'><br><br>"
+        "<button onclick='save()'>Add Network</button>"
+        "<p id='msg'></p>"
+        "</div>"
+        "<script>"
+        "function scan(){"
+        "document.getElementById('msg').innerText='Scanning...';"
+        "fetch('/scan').then(r=>r.json()).then(d=>{"
+        "let s=document.getElementById('net');s.innerHTML='';"
+        "d.sort((a,b)=>b.rssi-a.rssi);"
+        "d.forEach(n=>{let o=document.createElement('option');"
+        "o.text=n.ssid+' ('+n.rssi+' dBm)';o.value=n.ssid;s.add(o);});"
+        "document.getElementById('msg').innerText='Found '+d.length+' networks';});"
+        "}"
+        "function save(){"
+        "let n=document.getElementById('net');"
+        "let p=document.getElementById('p');"
+        "fetch('/save',{method:'POST',"
+        "body:'s='+encodeURIComponent(n.value)+'&p='+encodeURIComponent(p.value)})"
+        ".then(r=>r.text()).then(t=>document.getElementById('msg').innerText=t);"
+        "}"
+        "</script>"
+        "</body></html>";
 
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
-esp_err_t scan_get(httpd_req_t *req)
+static esp_err_t scan_get(httpd_req_t *req)
 {
     scan_networks();
     httpd_resp_set_type(req, "application/json");
@@ -239,65 +380,110 @@ esp_err_t scan_get(httpd_req_t *req)
     return ESP_OK;
 }
 
-esp_err_t save_post(httpd_req_t *req)
+static esp_err_t save_post(httpd_req_t *req)
 {
     char buf[200];
-    int len = httpd_req_recv(req, buf, sizeof(buf));
-    buf[len] = 0;
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad request");
+        return ESP_FAIL;
+    }
+    buf[len] = '\0';
 
     char ssid[32] = {0}, pass[64] = {0};
     sscanf(buf, "s=%31[^&]&p=%63s", ssid, pass);
 
+    if (ssid[0] == '\0') {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing SSID");
+        return ESP_FAIL;
+    }
+
     save_network(ssid, pass);
 
-    httpd_resp_sendstr(req, "Saved");
+    /* Nach dem Speichern sofort einen Connect-Versuch starten */
+    retry_count = 0;
+    xEventGroupSetBits(s_wifi_eg, BIT_DO_CONNECT);
+
+    httpd_resp_sendstr(req, "Saved – connecting...");
     return ESP_OK;
 }
 
-void start_web()
+static void start_web(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.stack_size = 8192; /* Fix 1: httpd-Task braucht Stack für den Scan-Aufruf */
+
     httpd_start(&server, &cfg);
 
-    httpd_uri_t r = {.uri="/", .method=HTTP_GET, .handler=root_get};
-    httpd_uri_t s = {.uri="/scan", .method=HTTP_GET, .handler=scan_get};
-    httpd_uri_t p = {.uri="/save", .method=HTTP_POST, .handler=save_post};
+    httpd_uri_t r = {.uri = "/",     .method = HTTP_GET,  .handler = root_get};
+    httpd_uri_t s = {.uri = "/scan", .method = HTTP_GET,  .handler = scan_get};
+    httpd_uri_t p = {.uri = "/save", .method = HTTP_POST, .handler = save_post};
 
     httpd_register_uri_handler(server, &r);
     httpd_register_uri_handler(server, &s);
     httpd_register_uri_handler(server, &p);
 }
 
-/* ================= RESET ================= */
+/* ================================================
+   RESET TASK
+   ================================================ */
 
-void reset_task(void* arg)
+static void reset_task(void *arg)
 {
-    gpio_set_direction(RESET_PIN, GPIO_MODE_INPUT);
+    /* Korrekte GPIO-Konfiguration mit internem Pull-Up */
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << RESET_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
 
     while (1) {
         if (gpio_get_level(RESET_PIN) == 0) {
-            vTaskDelay(4000 / portTICK_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(4000));
             if (gpio_get_level(RESET_PIN) == 0) {
+                ESP_LOGW(TAG, "Factory reset triggered!");
                 nvs_flash_erase();
                 esp_restart();
             }
         }
-        vTaskDelay(200 / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
-/* ================= MAIN ================= */
+/* ================================================
+   MAIN
+   ================================================ */
 
 void app_main(void)
 {
-    nvs_flash_init();
-    esp_netif_init();
-    esp_event_loop_create_default();
+    /*
+     * Fix 4: NVS-Init mit Fehlerbehandlung.
+     *   Bei korruptem NVS (nach Flash-Größen-Wechsel oder erstem Flash)
+     *   schlägt nvs_flash_init() fehl → RF-Calibration-Daten fehlen → Fehler.
+     *   Lösung: Bei bekannten Fehlern NVS löschen und neu initialisieren.
+     */
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS invalid (0x%x) – erasing and reinitialising", nvs_ret);
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     load_config();
-
     start_wifi();
     start_web();
 
-    xTaskCreate(reset_task, "reset", 2048, NULL, 5, NULL);
+    /*
+     * Fix 1: reset_task Stack 2048 → 4096.
+     *   gpio_config() und ESP_LOGW brauchen mehr als 2 KB.
+     */
+    xTaskCreate(reset_task, "reset", 4096, NULL, 3, NULL);
 }
