@@ -13,6 +13,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "lwip/ip4_addr.h"
 
 /* ================================================
    CONFIG
@@ -22,7 +23,6 @@
 #define MAX_NETWORKS     5
 #define MAX_AP_RECORDS   20
 
-/* Event-Bits für den WiFi-Manager-Task */
 #define BIT_DO_CONNECT   BIT0
 #define BIT_CONNECTED    BIT1
 
@@ -34,8 +34,9 @@ static const char *TAG = "repeater";
 
 static httpd_handle_t       server;
 static esp_netif_t         *ap_netif;
+static esp_netif_t         *sta_netif;
 static EventGroupHandle_t   s_wifi_eg;
-static SemaphoreHandle_t    s_scan_mutex;   /* Fix 5: Kein gleichzeitiger Scan */
+static SemaphoreHandle_t    s_scan_mutex;
 static int                  retry_count = 0;
 
 /* ================================================
@@ -82,7 +83,6 @@ static void save_network(const char *s, const char *p)
 {
     if (network_count >= MAX_NETWORKS) network_count = 0;
 
-    /* Fix 5: strlcpy statt strcpy – verhindert Buffer Overflow */
     strlcpy(networks[network_count].ssid, s, sizeof(networks[network_count].ssid));
     strlcpy(networks[network_count].pass, p, sizeof(networks[network_count].pass));
     network_count++;
@@ -103,24 +103,82 @@ static void save_network(const char *s, const char *p)
 }
 
 /* ================================================
-   WIFI CORE – nur vom Manager-Task aufzurufen!
+   NAT / DNS HELPERS
    ================================================ */
 
 /*
- * Fix 1: AP-Liste per malloc auf dem Heap statt auf dem Stack.
- *   wifi_ap_record_t list[20] = ~1760 Bytes auf dem Stack –
- *   im WiFi-Event-Task (3 KB Stack) → Stack Overflow.
+ * Fix: DNS-Server im AP-DHCP-Server setzen.
  *
- * Fix 2 + Fix 3: Diese Funktion wird NICHT mehr aus dem Event-Handler
- *   aufgerufen. Der Event-Handler setzt nur ein Bit; der Manager-Task
- *   führt den Scan blockend durch. Kein Blocking im WiFi-System-Task,
- *   keine Disconnect→Scan→Disconnect-Schleife mehr.
+ * Problem: Der AP-DHCP-Server gibt standardmäßig 192.168.4.1 als
+ * DNS-Server raus. LWIP hört aber auf Port 53 NICHT → DNS-Anfragen
+ * von AP-Clients laufen ins Leere → kein Internet trotz funktionierendem
+ * Routing.
+ *
+ * Lösung: Im DHCP-Server den vom Router erhaltenen DNS eintragen.
+ * Als Fallback 8.8.8.8, damit es auch ohne frischen DHCP-Lease klappt.
  */
+static void update_ap_dns(void)
+{
+    esp_netif_dns_info_t dns = {0};
+    bool got_dns = false;
+
+    /* Versuche, den DNS-Server der STA-Verbindung zu übernehmen */
+    if (sta_netif &&
+        esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+        dns.ip.u_addr.ip4.addr != 0) {
+        got_dns = true;
+        ESP_LOGI(TAG, "Using upstream DNS: " IPSTR,
+                 IP2STR(&dns.ip.u_addr.ip4));
+    }
+
+    /* Fallback auf Google-DNS */
+    if (!got_dns) {
+        IP4_ADDR(&dns.ip.u_addr.ip4, 8, 8, 8, 8);
+        dns.ip.type = ESP_IPADDR_TYPE_V4;
+        ESP_LOGW(TAG, "Using fallback DNS: 8.8.8.8");
+    }
+
+    /* DHCP-Server kurz stoppen, DNS-Option setzen, neu starten */
+    esp_netif_dhcps_stop(ap_netif);
+
+    esp_netif_dhcps_option(ap_netif,
+                           ESP_NETIF_OP_SET,
+                           ESP_NETIF_DOMAIN_NAME_SERVER,
+                           &dns.ip.u_addr.ip4.addr,
+                           sizeof(dns.ip.u_addr.ip4.addr));
+
+    esp_netif_dhcps_start(ap_netif);
+    ESP_LOGI(TAG, "AP DHCP DNS updated");
+}
+
+/*
+ * Fix: NAPT erst aktivieren, wenn STA eine IP hat.
+ *
+ * Problem: esp_netif_napt_enable() direkt nach esp_wifi_start()
+ * aufzurufen bewirkt nichts sinnvolles, weil die STA-Route noch
+ * nicht existiert. NAPT braucht eine aktive IP auf dem STA-Interface
+ * als "Uplink", auf das es NATten kann.
+ */
+static void enable_nat(void)
+{
+    esp_netif_napt_enable(ap_netif);
+    ESP_LOGI(TAG, "NAT enabled");
+}
+
+static void disable_nat(void)
+{
+    esp_netif_napt_disable(ap_netif);
+    ESP_LOGI(TAG, "NAT disabled");
+}
+
+/* ================================================
+   WIFI CORE
+   ================================================ */
+
 static void do_scan_and_connect(void)
 {
-    /* Fix 5: Scan-Mutex – verhindert gleichzeitigen Scan vom HTTP-Handler */
     if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(8000)) != pdTRUE) {
-        ESP_LOGW(TAG, "Scan mutex timeout, skipping connect scan");
+        ESP_LOGW(TAG, "Scan mutex timeout");
         return;
     }
 
@@ -132,7 +190,7 @@ static void do_scan_and_connect(void)
     }
 
     wifi_scan_config_t scan_cfg = {0};
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true); /* blocking OK hier */
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Scan failed: %s", esp_err_to_name(err));
         free(list);
@@ -161,7 +219,6 @@ static void do_scan_and_connect(void)
         wifi_config_t sta = {0};
         strlcpy((char *)sta.sta.ssid,     networks[best].ssid, sizeof(sta.sta.ssid));
         strlcpy((char *)sta.sta.password, networks[best].pass, sizeof(sta.sta.password));
-        /* Fix 5: Disconnect + kurze Pause vor erneutem Connect (Driver flush) */
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_wifi_set_config(WIFI_IF_STA, &sta);
@@ -176,28 +233,17 @@ static void do_scan_and_connect(void)
    WIFI MANAGER TASK
    ================================================ */
 
-/*
- * Fix 1: Eigener Task mit 8 KB Stack.
- * Fix 2: Wartet 1 s nach WiFi-Start bevor der erste Scan läuft
- *         (WiFi-Stack braucht Zeit zum Initialisieren).
- * Fix 3: Event-Handler setzt nur BIT_DO_CONNECT; dieser Task
- *         führt den blockenden Scan durch → keine Reconnect-Schleife.
- */
 static void wifi_manager_task(void *arg)
 {
-    /* Erster Connect-Versuch nach kurzem Delay */
     vTaskDelay(pdMS_TO_TICKS(1500));
     do_scan_and_connect();
 
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(
             s_wifi_eg, BIT_DO_CONNECT,
-            pdTRUE,   /* Bit nach Lesen löschen */
-            pdFALSE,
-            portMAX_DELAY);
+            pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & BIT_DO_CONNECT) {
-            /* Exponentielles Backoff: max. 30 s */
             int delay_s = (retry_count < 10) ? retry_count * 3 : 30;
             if (delay_s > 0) {
                 ESP_LOGI(TAG, "Reconnect in %d s (retry %d)", delay_s, retry_count);
@@ -212,26 +258,37 @@ static void wifi_manager_task(void *arg)
    WIFI EVENT HANDLER
    ================================================ */
 
-/*
- * Fix 3: Event-Handler tut NICHTS Blockierendes mehr.
- *   Kein esp_wifi_scan_start(), kein esp_wifi_connect() direkt.
- *   Nur Bit setzen → Manager-Task übernimmt.
- */
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_eg, BIT_CONNECTED);
+
+        /* Fix: NAT deaktivieren, solange kein Uplink vorhanden */
+        disable_nat();
+
         if (retry_count < 15) {
             retry_count++;
             xEventGroupSetBits(s_wifi_eg, BIT_DO_CONNECT);
         } else {
             ESP_LOGE(TAG, "Max retries reached – AP-only mode");
         }
+
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         retry_count = 0;
         xEventGroupSetBits(s_wifi_eg, BIT_CONNECTED);
-        ESP_LOGI(TAG, "STA connected, got IP");
+
+        /*
+         * Fix: NAT + DNS erst hier aktivieren/aktualisieren.
+         * Jetzt hat das STA-Interface eine IP und eine Route ins Internet →
+         * NAPT kann sinnvoll NATten, und der upstream DNS ist bekannt.
+         */
+        update_ap_dns();
+        enable_nat();
+
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "STA connected – IP: " IPSTR,
+                 IP2STR(&event->ip_info.ip));
     }
 }
 
@@ -244,16 +301,13 @@ static void start_wifi(void)
     s_wifi_eg    = xEventGroupCreate();
     s_scan_mutex = xSemaphoreCreateMutex();
 
-    esp_netif_create_default_wifi_sta();
-    ap_netif = esp_netif_create_default_wifi_ap();
+    sta_netif = esp_netif_create_default_wifi_sta();
+    ap_netif  = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    /* Fix 5: Storage RAM – kein häufiges Flash-Schreiben beim Reconnect */
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
-    /* Nur die Events registrieren, die wir wirklich brauchen */
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -272,27 +326,31 @@ static void start_wifi(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    esp_netif_napt_enable(ap_netif);
+    /*
+     * Fix: Kein esp_netif_napt_enable() hier!
+     * Wird erst in IP_EVENT_STA_GOT_IP aktiviert.
+     * Initialen DNS-Fallback (8.8.8.8) schon jetzt setzen,
+     * damit Clients, die sich vor dem ersten STA-Connect verbinden,
+     * bereits einen DNS-Eintrag haben.
+     */
+    update_ap_dns();
 
-    /* Fix 1: Manager-Task mit 8 KB Stack */
     xTaskCreate(wifi_manager_task, "wifi_mgr", 8192, NULL, 5, NULL);
 }
 
 /* ================================================
-   HTTP SCAN (vom httpd-Task aufgerufen)
+   HTTP SCAN
    ================================================ */
 
-static char scan_json[4096]; /* global – nicht auf dem Stack */
+static char scan_json[4096];
 
 static void scan_networks(void)
 {
-    /* Fix 5: Mutex gegen gleichzeitigen Scan aus dem Manager-Task */
     if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(10000)) != pdTRUE) {
         strlcpy(scan_json, "[]", sizeof(scan_json));
         return;
     }
 
-    /* Fix 1: Heap statt Stack */
     wifi_ap_record_t *list = malloc(MAX_AP_RECORDS * sizeof(wifi_ap_record_t));
     if (!list) {
         strlcpy(scan_json, "[]", sizeof(scan_json));
@@ -311,7 +369,6 @@ static void scan_networks(void)
     uint16_t count = MAX_AP_RECORDS;
     esp_wifi_scan_get_ap_records(&count, list);
 
-    /* Puffer-sicheres Aufbauen des JSON */
     int off = 0;
     off += snprintf(scan_json + off, sizeof(scan_json) - off, "[");
     for (int i = 0; i < count; i++) {
@@ -399,8 +456,6 @@ static esp_err_t save_post(httpd_req_t *req)
     }
 
     save_network(ssid, pass);
-
-    /* Nach dem Speichern sofort einen Connect-Versuch starten */
     retry_count = 0;
     xEventGroupSetBits(s_wifi_eg, BIT_DO_CONNECT);
 
@@ -411,8 +466,7 @@ static esp_err_t save_post(httpd_req_t *req)
 static void start_web(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size = 8192; /* Fix 1: httpd-Task braucht Stack für den Scan-Aufruf */
-
+    cfg.stack_size = 8192;
     httpd_start(&server, &cfg);
 
     httpd_uri_t r = {.uri = "/",     .method = HTTP_GET,  .handler = root_get};
@@ -430,7 +484,6 @@ static void start_web(void)
 
 static void reset_task(void *arg)
 {
-    /* Korrekte GPIO-Konfiguration mit internem Pull-Up */
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << RESET_PIN),
         .mode         = GPIO_MODE_INPUT,
@@ -459,16 +512,10 @@ static void reset_task(void *arg)
 
 void app_main(void)
 {
-    /*
-     * Fix 4: NVS-Init mit Fehlerbehandlung.
-     *   Bei korruptem NVS (nach Flash-Größen-Wechsel oder erstem Flash)
-     *   schlägt nvs_flash_init() fehl → RF-Calibration-Daten fehlen → Fehler.
-     *   Lösung: Bei bekannten Fehlern NVS löschen und neu initialisieren.
-     */
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS invalid (0x%x) – erasing and reinitialising", nvs_ret);
+        ESP_LOGW(TAG, "NVS invalid – erasing");
         ESP_ERROR_CHECK(nvs_flash_erase());
         nvs_ret = nvs_flash_init();
     }
@@ -481,9 +528,5 @@ void app_main(void)
     start_wifi();
     start_web();
 
-    /*
-     * Fix 1: reset_task Stack 2048 → 4096.
-     *   gpio_config() und ESP_LOGW brauchen mehr als 2 KB.
-     */
     xTaskCreate(reset_task, "reset", 4096, NULL, 3, NULL);
 }
