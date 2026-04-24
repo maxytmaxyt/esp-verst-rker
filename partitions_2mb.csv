@@ -1,0 +1,10 @@
+# Partition Table für 2 MB Flash (nodemcu-32s mit 2 MB)
+# Gesamt: 0x200000 (2 097 152 Bytes)
+#
+# Bootloader: 0x0000 – 0x8FFF (von esptool gehandhabt)
+# Partition-Table: 0x8000 (4 KB)
+#
+# Name,     Type,  SubType,  Offset,    Size
+nvs,        data,  nvs,      0x9000,    0x4000
+phy_init,   data,  phy,      0xd000,    0x1000
+factory,    app,   factory,  0x10000,   0x1e0000
