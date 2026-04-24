@@ -66,7 +66,7 @@ static void load_config(void)
         network_count = 0;
 
     for (int i = 0; i < network_count; i++) {
-        char key_s[8], key_p[8];
+        char key_s[16], key_p[16];
         snprintf(key_s, sizeof(key_s), "s%d", i);
         snprintf(key_p, sizeof(key_p), "p%d", i);
         size_t l1 = sizeof(networks[i].ssid);
@@ -92,7 +92,7 @@ static void save_network(const char *s, const char *p)
 
     nvs_set_i32(nvs, "count", network_count);
     for (int i = 0; i < network_count; i++) {
-        char key_s[8], key_p[8];
+        char key_s[16], key_p[16];
         snprintf(key_s, sizeof(key_s), "s%d", i);
         snprintf(key_p, sizeof(key_p), "p%d", i);
         nvs_set_str(nvs, key_s, networks[i].ssid);
